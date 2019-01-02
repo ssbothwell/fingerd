@@ -231,10 +231,7 @@ handleControlQuery conn sock state writeChan readChan msgInt = do
     print state'
     print thread
 
-    _ <- forkIO $ fix $ \loop' -> do
-        (nextNum, msg) <- atomically $ readTChan readChan
-        when (msgInt /= nextNum) $ sendMsg $ T.pack msg
-        loop'
+    _ <- readTChanLoop
 
     let userStatus = find (\(_, tid) -> tid == thread) $ getWhois state'
     case userStatus of
@@ -260,6 +257,9 @@ handleControlQuery conn sock state writeChan readChan msgInt = do
           logout currAccount oldState = writeTVar' . State $ filter (\(account', _) -> currAccount /= account') $ getWhois oldState
           whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
           broadcast msg = atomically $ writeTChan writeChan (msgInt, msg)
+          readTChanLoop = forkIO . forever $ do
+                (nextNum, msg) <- atomically $ readTChan readChan
+                when (msgInt /= nextNum) $ sendMsg $ T.pack msg
 
 
 --------------
