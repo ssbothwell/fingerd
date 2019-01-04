@@ -22,12 +22,12 @@ data Account =
             } deriving (Eq, Show)
 
 data User =
-    User { userId        :: Integer
-         , username      :: Text
-         , shell         :: Text
-         , homeDirectory :: Text
-         , realName      :: Text
-         , phone         :: Text
+    User { getUserId        :: Integer
+         , getUsername      :: Text
+         , getShell         :: Text
+         , getHomeDirectory :: Text
+         , getRealName      :: Text
+         , getPhone         :: Text
          } deriving (Eq, Show)
 
 type UserRow = (Null, Text, Text, Text, Text, Text)

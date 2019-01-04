@@ -1,6 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE QuasiQuotes #-}
-{-# LANGUAGE RecordWildCards #-}
 module Main where
 
 import Control.Concurrent
@@ -8,7 +6,6 @@ import Control.Concurrent.STM
 import Control.Monad (forever, void)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Reader
-import Control.Monad.Fix
 import Control.Monad.Trans.Class
 import Data.List (intersperse, find, intercalate)
 import Data.Text (Text)
@@ -35,15 +32,15 @@ data Env =
         , getControlSock :: Socket
         , getFingerSock  :: Socket
         , getStateTVar   :: TVar State 
-        , getRChannel    :: TChan Msg
+        , getWChannel    :: TChan Msg
         } 
 
 data ThreadEnv =
     ThreadEnv { getConn'        :: Connection
               , getControlSock' :: Socket
               , getStateTVar'   :: TVar State
-              , getRChannel'    :: TChan Msg
               , getWChannel'    :: TChan Msg
+              , getRChannel'    :: TChan Msg
               }
 
 type Msg = String
@@ -116,16 +113,10 @@ getUser conn username = do
         Left err' -> print err' >> return "Problem finding user"
         Right user' -> return $ formatUser user'
 
---getUserR :: Text -> ReaderT ThreadEnv IO Text
---getUserR username = do
---    conn <- asks getConn'
---    liftIO $ getUser conn username
-
-
 getUsers :: Connection -> IO Text
 getUsers conn = do
     rows <- query_ conn selectUsersQuery
-    let usernames = map username rows
+    let usernames = map getUsername rows
         newlineSeperated =
             T.concat $ (intersperse "\n" usernames) ++ pure (T.pack "\r\n")
     return newlineSeperated
@@ -239,20 +230,17 @@ fingerd = forever $ do
     
 controld :: ReaderT Env IO ()
 controld = forever $ do
-    state <- asks getStateTVar
+    stateTVar <- asks getStateTVar
     conn <- asks getConn
     sock <- asks getControlSock
-    rChannelTVar <- asks getRChannel
+    wChannel<- asks getWChannel
+    rChannel <- liftIO . atomically $ cloneTChan wChannel
     (sock', _) <- lift $ accept sock
 
-    void . lift . forkIO $ fix $ \loop -> do
-        void . atomically $ readTChan rChannelTVar
-        loop
-    commLine <- lift . atomically $ cloneTChan rChannelTVar
 
     lift $ do
         putStrLn "Got connection, handling query"
-        let threadEnv = ThreadEnv conn sock' state rChannelTVar commLine
+        let threadEnv = ThreadEnv conn sock' stateTVar wChannel rChannel
         forkIO $ runReaderT handleControlQuery threadEnv
 
 createSocket :: Integer -> IO Socket
@@ -272,8 +260,8 @@ main = withSocketsDo $ do
     controlSock <- createSocket 78
     fingerSock <- createSocket 79
     state <- atomically $ newTVar (State [])
-    tchan <- newTChanIO
-    let env = Env conn controlSock fingerSock state tchan
+    wChannel <- newTChanIO
+    let env = Env conn controlSock fingerSock state wChannel
 
     _ <- forkIO $ runReaderT controld env 
     runReaderT fingerd env
