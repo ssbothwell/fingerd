@@ -6,9 +6,10 @@ module Main where
 import Control.Applicative
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Monad (forever, when)
-import Control.Monad.Fix
+import Control.Monad (forever, void)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Reader
+import Control.Monad.Fix
 import Control.Monad.Trans.Class
 import Data.List (intersperse, find, intercalate)
 import Data.Text (Text)
@@ -32,15 +33,22 @@ import TelnetLib (prompt)
 -----------------------------
 
 data Env = 
-    Env { dbConn :: Connection
+    Env { dbConn      :: Connection
         , controlSock :: Socket
-        , fingerSock :: Socket
-        , getState :: TVar State 
-        , getTChan :: TChan Msg
-        , getMsgCount :: Int
+        , fingerSock  :: Socket
+        , getState    :: TVar State 
+        , rChannel    :: TChan Msg
         } 
 
-type Msg = (Int, String)
+data ThreadEnv =
+    ThreadEnv { dbConn'      :: Connection
+              , controlSock' :: Socket
+              , stateTVar'   :: TVar State
+              , rChannel'    :: TChan Msg
+              , wChannel'    :: TChan Msg
+              }
+
+type Msg = (String)
 type Username = String
 
 data State = 
@@ -164,27 +172,29 @@ checkLogin _ _ (Left err') = print err' >> return (Left "Invalid Password")
 checkLogin conn (Right acc) (Right pass) = do
     eAccount <- selectAccount conn acc 
     return $ eAccount >>= checkPassword pass 
-    
-loginPrompt :: Connection -> Socket -> TVar State -> TChan Msg -> TChan Msg -> Int -> IO ()
-loginPrompt conn sock state tchan readChan msgInt = do
-    thread <- myThreadId
-    account <- prompt sock "Login: "
-    password <- prompt sock "Password: "
+
+loginPrompt :: ReaderT ThreadEnv IO ()
+loginPrompt = do
+    stateTVar <- asks stateTVar'
+    conn <- asks dbConn'
+    sock <- asks controlSock'
+
+    thread <- liftIO $ myThreadId
+    account <- liftIO $ prompt sock "Login: "
+    password <- liftIO $ prompt sock "Password: "
 
     let parsedAccount = resultToEither $ parseByteString word mempty account
     let parsedPassword = resultToEither $ parseByteString word mempty password
     
-    loginResult <- checkLogin conn parsedAccount parsedPassword
+    loginResult <- liftIO $ checkLogin conn parsedAccount parsedPassword
     case loginResult of
-        Left err' -> print err' >> sendMsg err' >> loginPrompt conn sock state tchan readChan msgInt
+        Left err' -> liftIO (print err' >> sendMsg sock err') >> loginPrompt --conn sock state tchan readChan
         Right acc -> do
-            state' <- readTVarIO state
-            writeTVar' $ State ((acc, thread):(getWhois state'))
-            print $ T.append (getAccount acc) " Logged In"
-            sendMsg "Login Succesful"
-            handleControlQuery conn sock state tchan readChan msgInt
-    where sendMsg msg = sendAll sock . encodeUtf8 $ T.append msg "\r\n"
-          writeTVar' = atomically . writeTVar state
+            state' <- liftIO $ readTVarIO stateTVar
+            liftIO $ writeTVarIO stateTVar (State ((acc, thread):(getWhois state')))
+            liftIO $ print $ T.append (getAccount acc) " Logged In"
+            liftIO $ sendMsg sock "Login Succesful"
+            handleControlQuery
 
 addUser :: Connection -> User -> IO (Text)
 addUser conn (User _ a b c d e) = do
@@ -219,47 +229,79 @@ handleQuery conn sock = do
             close sock
         name -> do
             eUser <- getUser conn (decodeUtf8 name) 
-            sendMsg eUser
+            sendMsg sock eUser
             close sock
             return ()
-    where sendMsg msg = sendAll sock . encodeUtf8 $ T.append msg "\r\n"
 
-handleControlQuery :: Connection -> Socket -> TVar State -> TChan Msg -> TChan Msg -> Int -> IO ()
-handleControlQuery conn sock state writeChan readChan msgInt = do
-    state' <- readTVarIO state
-    thread <- myThreadId
-    print state'
-    print thread
+----------------------
+---- Control Loop ----
+----------------------
 
-    _ <- readTChanLoop
+processCommand :: Maybe (Account, ThreadId) -> ReaderT ThreadEnv IO ()
+processCommand Nothing = loginPrompt
+processCommand (Just (account, _)) = do
+    stateTVar <- asks stateTVar'
+    conn <- asks dbConn'
+    sock <- asks controlSock'
+    wChannel <- asks wChannel'
+    state <- liftIO $ readTVarIO stateTVar
 
-    let userStatus = find (\(_, tid) -> tid == thread) $ getWhois state'
-    case userStatus of
-        Nothing -> loginPrompt conn sock state writeChan readChan msgInt
-        Just (account, _) -> do
-            cmd <- prompt sock "> "
-            cmdParse <- pure $ runParse cmd
-            putStrLn $ show cmdParse
-            case cmdParse of
-                Right GetUsers -> getUsers conn >>= sendMsg >> loop msgInt
-                Right (GetUser user) -> getUser conn user >>= sendMsg >> loop msgInt
-                Right (AddUser user) -> addUser conn user >>= sendMsg >> loop msgInt
-                Right (Echo msg) -> sendMsg msg >> loop msgInt
-                Right Exit -> logout account state' >> sendMsg "Goodbye!" >> close sock
-                Right Logout -> logout account state' >> loop msgInt
-                Right Shutdown -> sendMsg "Shutting Down! Goodbye!" >> SQLite.close conn >> close sock >> exitSuccess
-                Right Whois -> sendMsg (whois state') >> loop msgInt
-                Right (Say msg) -> broadcast (T.unpack msg) >> loop (msgInt+1)
-                Left err' -> sendMsg  "Command not recognized" >> (putStrLn $ show err') >> loop msgInt
-    where loop msgInt = handleControlQuery conn sock state writeChan readChan msgInt
-          sendMsg msg = sendAll sock . encodeUtf8 $ T.append msg "\r\n"
-          writeTVar' = atomically . writeTVar state
-          logout currAccount oldState = writeTVar' . State $ filter (\(account', _) -> currAccount /= account') $ getWhois oldState
-          whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
-          broadcast msg = atomically $ writeTChan writeChan (msgInt, msg)
-          readTChanLoop = forkIO . forever $ do
-                (nextNum, msg) <- atomically $ readTChan readChan
-                when (msgInt /= nextNum) $ sendMsg $ T.pack msg
+    liftIO $ do
+        cmd <- prompt sock "> "
+        cmdParse <- pure $ runParse cmd
+        putStrLn $ show cmdParse
+        case cmdParse of
+            Right GetUsers -> getUsers conn >>= (sendMsg sock)
+            Right (GetUser user) -> getUser conn user >>= (sendMsg sock)
+            Right (AddUser user) -> addUser conn user >>= (sendMsg sock)
+            Right (Echo msg) -> sendMsg sock msg
+            Right Exit -> logout stateTVar account state >> sendMsg sock "Goodbye!" >> close sock
+            Right Logout -> logout stateTVar account state
+            Right Shutdown -> sendMsg sock "Shutting Down! Goodbye!" >> SQLite.close conn >> close sock >> exitSuccess
+            Right Whois -> sendMsg sock (whois state)
+            Right (Say msg) -> broadcast (T.unpack msg) wChannel
+            Left err' -> sendMsg sock  "Command not recognized" >> (putStrLn $ show err')
+
+handleControlQuery :: ReaderT ThreadEnv IO ()
+handleControlQuery = do
+    stateTVar <- asks stateTVar'
+    sock <- asks controlSock'
+    rChannelTVar <- asks rChannel'
+
+    state <- liftIO $ readTVarIO stateTVar
+    thread <- liftIO $ myThreadId
+    liftIO $ readTChanLoop sock rChannelTVar
+    liftIO $ print state
+    liftIO $ print thread
+    let user = find (\(_, tid) -> tid == thread) $ getWhois state
+
+    processCommand user 
+    handleControlQuery 
+
+forkReader :: ReaderT r IO a -> ReaderT r IO ThreadId
+forkReader = undefined
+
+logout :: TVar State -> Account -> State -> IO ()
+logout stateTVar currAccount oldState = (writeTVarIO stateTVar) . State . filter f $ getWhois oldState
+    where f (account', _) = currAccount /= account'
+
+writeTVarIO :: TVar State -> State -> IO ()
+writeTVarIO tvar = atomically . writeTVar tvar
+
+broadcast :: String -> TChan Msg -> IO ()
+broadcast msg wChannel = do
+    liftIO . atomically $ writeTChan wChannel msg
+
+sendMsg :: Socket -> Text -> IO ()
+sendMsg sock msg = liftIO . sendAll sock . encodeUtf8 $ T.append msg "\r\n"
+
+readTChanLoop :: Socket -> TChan Msg -> IO ()
+readTChanLoop sock rChannel = liftIO . void . forkIO . forever $ do
+      msg <- atomically $ readTChan rChannel
+      sendMsg sock (T.pack msg)
+
+whois :: State -> Text
+whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
 
 
 --------------
@@ -280,18 +322,18 @@ controld = forever $ do
     state <- asks getState
     conn <- asks dbConn
     sock <- asks controlSock
-    tchan <- asks getTChan
-    msgInt <- asks getMsgCount
+    rChannelTVar <- asks rChannel
     (sock', _) <- lift $ accept sock
 
-    _ <- lift . forkIO $ fix $ \loop -> do
-        (_, _) <- atomically $ readTChan tchan
+    void . lift . forkIO $ fix $ \loop -> do
+        void . atomically $ readTChan rChannelTVar
         loop
-    commLine <- lift . atomically $ cloneTChan tchan 
+    commLine <- lift . atomically $ cloneTChan rChannelTVar
 
     lift $ do
         putStrLn "Got connection, handling query"
-        forkIO $ handleControlQuery conn sock' state tchan commLine msgInt
+        let threadEnv = ThreadEnv conn sock' state rChannelTVar commLine
+        forkIO $ runReaderT handleControlQuery threadEnv
 
 createSocket :: Integer -> IO Socket
 createSocket port = do
@@ -311,7 +353,7 @@ main = withSocketsDo $ do
     fingerSock <- createSocket 79
     state <- atomically $ newTVar (State [])
     tchan <- newTChanIO
-    let env = Env conn controlSock fingerSock state tchan 0
+    let env = Env conn controlSock fingerSock state tchan
 
     _ <- forkIO $ runReaderT controld env 
     runReaderT fingerd env
