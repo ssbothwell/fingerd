@@ -121,20 +121,43 @@ getUsers conn = do
             T.concat $ (intersperse "\n" usernames) ++ pure (T.pack "\r\n")
     return newlineSeperated
 
--- TODO: Update to use new telnetd prompt function. See handleControlQuery below.
-handleQuery :: Connection -> Socket -> IO ()
-handleQuery conn sock = do
-    msg <- recv sock 1024
-    case msg of
-        "\r\n" -> do
-            users <- getUsers conn
-            sendAll sock (encodeUtf8 users)
-            close sock
-        name -> do
-            eUser <- getUser conn (decodeUtf8 name) 
-            sendAll sock (encodeUtf8 eUser)
-            close sock
-            return ()
+logout :: Account -> ReaderT ThreadEnv IO ()
+logout currAccount = do
+    stateTVar <- asks getStateTVar'
+    state <- liftIO $ readTVarIO stateTVar
+    writeTVarR $ State (filter f (getWhois state))
+    where f (account', _) = currAccount /= account'
+
+writeTVarR :: State -> ReaderT ThreadEnv IO ()
+writeTVarR state = do
+    stateTVar <- asks getStateTVar'
+    liftIO . atomically $ writeTVar stateTVar state
+
+broadcast :: String -> ReaderT ThreadEnv IO ()
+broadcast msg = do
+    wChannel <- asks getWChannel'
+    liftIO . atomically $ writeTChan wChannel msg
+
+sendMsg :: Text -> ReaderT ThreadEnv IO ()
+sendMsg msg = do
+    sock <- asks getControlSock'
+    liftIO . sendAll sock . encodeUtf8 $ T.append msg "\r\n"
+
+forkReader :: ReaderT r IO () -> ReaderT r IO ThreadId
+forkReader action = do
+    env <- ask
+    liftIO . forkIO $ runReaderT action env
+
+readTChanLoop :: ReaderT ThreadEnv IO ()
+readTChanLoop = void . forkReader . forever $ do
+    rChannel <- asks getRChannel'
+    msg <- liftIO . atomically $ readTChan rChannel
+    sendMsg (T.pack msg)
+
+whois :: State -> Text
+whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
+
+
 
 ----------------------
 ---- Control Loop ----
@@ -177,42 +200,20 @@ handleControlQuery = do
     processCommand user 
     handleControlQuery 
 
-
-logout :: Account -> ReaderT ThreadEnv IO ()
-logout currAccount = do
-    stateTVar <- asks getStateTVar'
-    state <- liftIO $ readTVarIO stateTVar
-    writeTVarR $ State (filter f (getWhois state))
-    where f (account', _) = currAccount /= account'
-
-writeTVarR :: State -> ReaderT ThreadEnv IO ()
-writeTVarR state = do
-    stateTVar <- asks getStateTVar'
-    liftIO . atomically $ writeTVar stateTVar state
-
-broadcast :: String -> ReaderT ThreadEnv IO ()
-broadcast msg = do
-    wChannel <- asks getWChannel'
-    liftIO . atomically $ writeTChan wChannel msg
-
-sendMsg :: Text -> ReaderT ThreadEnv IO ()
-sendMsg msg = do
-    sock <- asks getControlSock'
-    liftIO . sendAll sock . encodeUtf8 $ T.append msg "\r\n"
-
-forkReader :: ReaderT r IO () -> ReaderT r IO ThreadId
-forkReader action = do
-    env <- ask
-    liftIO . forkIO $ runReaderT action env
-
-readTChanLoop :: ReaderT ThreadEnv IO ()
-readTChanLoop = void . forkReader . forever $ do
-    rChannel <- asks getRChannel'
-    msg <- liftIO . atomically $ readTChan rChannel
-    sendMsg (T.pack msg)
-
-whois :: State -> Text
-whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
+-- TODO: Update to use new telnetd prompt function. See handleControlQuery below.
+handleQuery :: Connection -> Socket -> IO ()
+handleQuery conn sock = do
+    msg <- recv sock 1024
+    case msg of
+        "\r\n" -> do
+            users <- getUsers conn
+            sendAll sock (encodeUtf8 users)
+            close sock
+        name -> do
+            eUser <- getUser conn (decodeUtf8 name) 
+            sendAll sock (encodeUtf8 eUser)
+            close sock
+            return ()
 
 
 --------------
