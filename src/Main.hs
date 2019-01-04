@@ -3,7 +3,6 @@
 {-# LANGUAGE RecordWildCards #-}
 module Main where
 
-import Control.Applicative
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad (forever, void)
@@ -18,14 +17,13 @@ import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Database.SQLite.Simple (Connection, open, query_)
 import qualified Database.SQLite.Simple as SQLite
 import Network.Socket hiding (recv)
-import Data.ByteString (ByteString)
---import qualified Data.ByteString as BS
 import Network.Socket.ByteString (recv, sendAll)
 import System.Exit (exitSuccess)
-import Text.Trifecta
+import Text.Trifecta (parseByteString)
 
 import SqliteLib
 import TelnetLib (prompt)
+import Parser
 
 
 -----------------------------
@@ -33,126 +31,34 @@ import TelnetLib (prompt)
 -----------------------------
 
 data Env = 
-    Env { dbConn      :: Connection
-        , controlSock :: Socket
-        , fingerSock  :: Socket
-        , getState    :: TVar State 
-        , rChannel    :: TChan Msg
+    Env { getConn        :: Connection
+        , getControlSock :: Socket
+        , getFingerSock  :: Socket
+        , getStateTVar   :: TVar State 
+        , getRChannel    :: TChan Msg
         } 
 
 data ThreadEnv =
-    ThreadEnv { dbConn'      :: Connection
-              , controlSock' :: Socket
-              , stateTVar'   :: TVar State
-              , rChannel'    :: TChan Msg
-              , wChannel'    :: TChan Msg
+    ThreadEnv { getConn'        :: Connection
+              , getControlSock' :: Socket
+              , getStateTVar'   :: TVar State
+              , getRChannel'    :: TChan Msg
+              , getWChannel'    :: TChan Msg
               }
 
-type Msg = (String)
+type Msg = String
 type Username = String
 
 data State = 
     State { getWhois :: [(Account, ThreadId)] } 
     deriving Show
 
-data Command = 
-      GetUsers
-    | GetUser Text
-    | AddUser User
-    | Echo Text
-    | Exit
-    | Shutdown
-    | Logout
-    | Whois
-    | Say Text
-    deriving (Eq, Show)
-
-
-------------------------
----- Command Parser ----
-------------------------
-
-word :: Parser Text
-word = token $ do
-    str <- some letter
-    return $ T.pack str
-
-parserGetUsers :: Parser Command
-parserGetUsers = symbol "getUsers" *> return GetUsers
-
-parserGetUser :: Parser Command
-parserGetUser = token $ do
-    _ <- string "getUser"
-    _ <- char ' '
-    username <- word
-    return $ GetUser username
-
-parserAddUser :: Parser Command
-parserAddUser = token $ do
-    _ <- string "addUser"
-    _ <- char ' '
-    username' <- word
-    shell' <- word
-    homeDir' <- word
-    realName' <- word
-    phone' <- word
-    return $ AddUser (User 0 username' shell' homeDir' realName' phone')
-
-parserExit :: Parser Command
-parserExit = token $ do
-    _ <- symbol "exit"
-    return $ Exit
-
-parserShutdown :: Parser Command
-parserShutdown = token $ do
-    _ <- symbol "shutdown"
-    return $ Shutdown
-
-parserLogout :: Parser Command
-parserLogout = token $ do
-    _ <- symbol "logout"
-    return $ Logout
-
-parserWhois :: Parser Command
-parserWhois = token $ do
-    _ <- symbol "whois"
-    return $ Whois
-
-parserSay :: Parser Command
-parserSay = token $ do
-    _ <- symbol "say"
-    str <- anyChar `manyTill` (char '\r' <|> char '\n')
-    return $ Say (T.pack str)
-
-parserEcho :: Parser Command
-parserEcho = token $ do
-    _ <- symbol "echo"
-    str <- anyChar `manyTill` (char '\r' <|> char '\n')
-    return $ Echo (T.pack str)
-
-commandParser :: Parser Command
-commandParser =  parserGetUsers 
-             <|> parserGetUser 
-             <|> parserAddUser 
-             <|> parserExit
-             <|> parserShutdown
-             <|> parserEcho
-             <|> parserLogout
-             <|> parserWhois
-             <|> parserSay
-
-runParse :: ByteString -> Either Text Command
-runParse = resultToEither . parseByteString commandParser mempty
-    
-resultToEither :: Result a -> Either Text a
-resultToEither (Failure err') = Left . T.pack $ show err'
-resultToEither (Success a) = Right a
-
 
 --------------------------
 ---- Server Functions ----
 --------------------------
 
+-- I wish this worked:
 --checkLogin' :: Connection -> Either Text Text -> Either Text Text -> IO (Either Text Account)
 --checkLogin' conn acc pass = do
 --    acc' <- acc
@@ -175,9 +81,9 @@ checkLogin conn (Right acc) (Right pass) = do
 
 loginPrompt :: ReaderT ThreadEnv IO ()
 loginPrompt = do
-    stateTVar <- asks stateTVar'
-    conn <- asks dbConn'
-    sock <- asks controlSock'
+    stateTVar <- asks getStateTVar'
+    conn <- asks getConn'
+    sock <- asks getControlSock'
 
     thread <- liftIO $ myThreadId
     account <- liftIO $ prompt sock "Login: "
@@ -240,10 +146,10 @@ handleQuery conn sock = do
 processCommand :: Maybe (Account, ThreadId) -> ReaderT ThreadEnv IO ()
 processCommand Nothing = loginPrompt
 processCommand (Just (account, _)) = do
-    stateTVar <- asks stateTVar'
-    conn <- asks dbConn'
-    sock <- asks controlSock'
-    wChannel <- asks wChannel'
+    stateTVar <- asks getStateTVar'
+    conn <- asks getConn'
+    sock <- asks getControlSock'
+    wChannel <- asks getWChannel'
     state <- liftIO $ readTVarIO stateTVar
 
     liftIO $ do
@@ -264,9 +170,9 @@ processCommand (Just (account, _)) = do
 
 handleControlQuery :: ReaderT ThreadEnv IO ()
 handleControlQuery = do
-    stateTVar <- asks stateTVar'
-    sock <- asks controlSock'
-    rChannelTVar <- asks rChannel'
+    stateTVar <- asks getStateTVar'
+    sock <- asks getControlSock'
+    rChannelTVar <- asks getRChannel'
 
     state <- liftIO $ readTVarIO stateTVar
     thread <- liftIO $ myThreadId
@@ -310,8 +216,8 @@ whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curSt
 
 fingerd :: ReaderT Env IO ()
 fingerd = forever $ do
-    conn <- asks dbConn
-    sock <- asks fingerSock
+    conn <- asks getConn
+    sock <- asks getFingerSock
     (sock', _) <- lift $ accept sock
     lift $ do
         putStrLn "Got connection, handling query"
@@ -319,10 +225,10 @@ fingerd = forever $ do
     
 controld :: ReaderT Env IO ()
 controld = forever $ do
-    state <- asks getState
-    conn <- asks dbConn
-    sock <- asks controlSock
-    rChannelTVar <- asks rChannel
+    state <- asks getStateTVar
+    conn <- asks getConn
+    sock <- asks getControlSock
+    rChannelTVar <- asks getRChannel
     (sock', _) <- lift $ accept sock
 
     void . lift . forkIO $ fix $ \loop -> do
