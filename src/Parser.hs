@@ -95,4 +95,3 @@ runParse = resultToEither . parseByteString commandParser mempty
 resultToEither :: Result a -> Either Text a
 resultToEither (Failure err') = Left . T.pack $ show err'
 resultToEither (Success a) = Right a
-

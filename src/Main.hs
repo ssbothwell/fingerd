@@ -94,12 +94,12 @@ loginPrompt = do
     
     loginResult <- liftIO $ checkLogin conn parsedAccount parsedPassword
     case loginResult of
-        Left err' -> liftIO (print err' >> sendMsg sock err') >> loginPrompt --conn sock state tchan readChan
+        Left err' -> liftIO (print err') >> sendMsg err' >> loginPrompt
         Right acc -> do
             state' <- liftIO $ readTVarIO stateTVar
-            liftIO $ writeTVarIO stateTVar (State ((acc, thread):(getWhois state')))
+            writeTVarR $ State ((acc, thread):(getWhois state'))
             liftIO $ print $ T.append (getAccount acc) " Logged In"
-            liftIO $ sendMsg sock "Login Succesful"
+            sendMsg "Login Succesful"
             handleControlQuery
 
 addUser :: Connection -> User -> IO (Text)
@@ -109,12 +109,18 @@ addUser conn (User _ a b c d e) = do
         Left err' -> print err' >> return "Problem adding user"
         Right res -> return $ formatUser res
 
-getUser :: Connection -> Text -> IO (Text)
+getUser :: Connection -> Text -> IO Text
 getUser conn username = do
     eUser <- selectUser conn (T.strip username)
     case eUser of
         Left err' -> print err' >> return "Problem finding user"
         Right user' -> return $ formatUser user'
+
+--getUserR :: Text -> ReaderT ThreadEnv IO Text
+--getUserR username = do
+--    conn <- asks getConn'
+--    liftIO $ getUser conn username
+
 
 getUsers :: Connection -> IO Text
 getUsers conn = do
@@ -135,7 +141,7 @@ handleQuery conn sock = do
             close sock
         name -> do
             eUser <- getUser conn (decodeUtf8 name) 
-            sendMsg sock eUser
+            sendAll sock (encodeUtf8 eUser)
             close sock
             return ()
 
@@ -149,34 +155,30 @@ processCommand (Just (account, _)) = do
     stateTVar <- asks getStateTVar'
     conn <- asks getConn'
     sock <- asks getControlSock'
-    wChannel <- asks getWChannel'
     state <- liftIO $ readTVarIO stateTVar
 
-    liftIO $ do
-        cmd <- prompt sock "> "
-        cmdParse <- pure $ runParse cmd
-        putStrLn $ show cmdParse
-        case cmdParse of
-            Right GetUsers -> getUsers conn >>= (sendMsg sock)
-            Right (GetUser user) -> getUser conn user >>= (sendMsg sock)
-            Right (AddUser user) -> addUser conn user >>= (sendMsg sock)
-            Right (Echo msg) -> sendMsg sock msg
-            Right Exit -> logout stateTVar account state >> sendMsg sock "Goodbye!" >> close sock
-            Right Logout -> logout stateTVar account state
-            Right Shutdown -> sendMsg sock "Shutting Down! Goodbye!" >> SQLite.close conn >> close sock >> exitSuccess
-            Right Whois -> sendMsg sock (whois state)
-            Right (Say msg) -> broadcast (T.unpack msg) wChannel
-            Left err' -> sendMsg sock  "Command not recognized" >> (putStrLn $ show err')
+    cmd <- liftIO $ prompt sock "> "
+    cmdParse <- pure $ runParse cmd
+    liftIO $ putStrLn $ show cmdParse
+    case cmdParse of
+        Right GetUsers -> liftIO (getUsers conn) >>= sendMsg
+        Right (GetUser user) -> liftIO (getUser conn user) >>= sendMsg
+        Right (AddUser user) -> liftIO (addUser conn user) >>= sendMsg
+        Right (Echo msg) -> sendMsg msg
+        Right Exit -> logout account >> sendMsg "Goodbye!" >> liftIO (close sock)
+        Right Logout -> logout account
+        Right Shutdown -> sendMsg "Shutting Down! Goodbye!" >> liftIO (SQLite.close conn >> close sock >> exitSuccess)
+        Right Whois -> sendMsg (whois state)
+        Right (Say msg) -> broadcast (T.unpack msg)
+        Left err' -> sendMsg "Command not recognized" >> liftIO (putStrLn $ show err')
 
 handleControlQuery :: ReaderT ThreadEnv IO ()
 handleControlQuery = do
     stateTVar <- asks getStateTVar'
-    sock <- asks getControlSock'
-    rChannelTVar <- asks getRChannel'
 
     state <- liftIO $ readTVarIO stateTVar
     thread <- liftIO $ myThreadId
-    liftIO $ readTChanLoop sock rChannelTVar
+    readTChanLoop
     liftIO $ print state
     liftIO $ print thread
     let user = find (\(_, tid) -> tid == thread) $ getWhois state
@@ -184,27 +186,39 @@ handleControlQuery = do
     processCommand user 
     handleControlQuery 
 
-forkReader :: ReaderT r IO a -> ReaderT r IO ThreadId
-forkReader = undefined
 
-logout :: TVar State -> Account -> State -> IO ()
-logout stateTVar currAccount oldState = (writeTVarIO stateTVar) . State . filter f $ getWhois oldState
+logout :: Account -> ReaderT ThreadEnv IO ()
+logout currAccount = do
+    stateTVar <- asks getStateTVar'
+    state <- liftIO $ readTVarIO stateTVar
+    writeTVarR $ State (filter f (getWhois state))
     where f (account', _) = currAccount /= account'
 
-writeTVarIO :: TVar State -> State -> IO ()
-writeTVarIO tvar = atomically . writeTVar tvar
+writeTVarR :: State -> ReaderT ThreadEnv IO ()
+writeTVarR state = do
+    stateTVar <- asks getStateTVar'
+    liftIO . atomically $ writeTVar stateTVar state
 
-broadcast :: String -> TChan Msg -> IO ()
-broadcast msg wChannel = do
+broadcast :: String -> ReaderT ThreadEnv IO ()
+broadcast msg = do
+    wChannel <- asks getWChannel'
     liftIO . atomically $ writeTChan wChannel msg
 
-sendMsg :: Socket -> Text -> IO ()
-sendMsg sock msg = liftIO . sendAll sock . encodeUtf8 $ T.append msg "\r\n"
+sendMsg :: Text -> ReaderT ThreadEnv IO ()
+sendMsg msg = do
+    sock <- asks getControlSock'
+    liftIO . sendAll sock . encodeUtf8 $ T.append msg "\r\n"
 
-readTChanLoop :: Socket -> TChan Msg -> IO ()
-readTChanLoop sock rChannel = liftIO . void . forkIO . forever $ do
-      msg <- atomically $ readTChan rChannel
-      sendMsg sock (T.pack msg)
+forkReader :: ReaderT r IO () -> ReaderT r IO ThreadId
+forkReader action = do
+    env <- ask
+    liftIO . forkIO $ runReaderT action env
+
+readTChanLoop :: ReaderT ThreadEnv IO ()
+readTChanLoop = void . forkReader . forever $ do
+    rChannel <- asks getRChannel'
+    msg <- liftIO . atomically $ readTChan rChannel
+    sendMsg (T.pack msg)
 
 whois :: State -> Text
 whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
