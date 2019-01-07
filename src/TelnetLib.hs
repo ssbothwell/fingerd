@@ -4,6 +4,7 @@ module TelnetLib where
 --import Control.Concurrent
 import Control.Monad.State
 import Data.Text()
+import Data.Text.Encoding (encodeUtf8)
 import Data.Word
 import Network.Socket hiding (recv)
 import Data.ByteString (ByteString)
@@ -32,7 +33,7 @@ data TelnetCommand =
     deriving (Show, Eq)
 
 data MessageMode = Normal | Command | SubNegotiation
-data MessageState = MessageState { getBuffer :: ByteString, getMessageMode :: MessageMode }
+data MessageState = MessageState { getBuffer :: (Maybe ByteString), getMessageMode :: MessageMode }
 
 toTelnetCommand :: Word8 -> TelnetCommand
 toTelnetCommand w
@@ -55,6 +56,17 @@ toTelnetCommand w
     | otherwise = Message w
 
 
+addWordToBuffer :: Word8 -> Maybe ByteString -> Maybe ByteString
+addWordToBuffer w Nothing = Just $ BS.pack [w]
+addWordToBuffer w (Just buffer) = Just $ BS.append buffer (BS.pack [w])
+
+eraseCharFromBuffer :: Maybe ByteString -> Maybe ByteString
+eraseCharFromBuffer Nothing = Nothing
+eraseCharFromBuffer (Just buffer) =
+    case BS.unsnoc buffer of
+        Just (buffer', _) -> Just buffer'
+        Nothing -> Nothing
+
 handleStream :: Word8 -> State MessageState ()
 handleStream word = do
     buffer <- gets getBuffer
@@ -64,17 +76,14 @@ handleStream word = do
                 case toTelnetCommand word of
                     -- TODO: Handle '\r\n' in mid stream and '\x08' for clients
                     -- that stream characters as typed.
-                    Message w -> put $ MessageState (BS.append buffer (BS.pack [w])) Normal
+                    Message w -> put $ MessageState (addWordToBuffer w buffer) Normal
                     IAC -> put $ MessageState buffer Command
                     _ -> put $ MessageState buffer mode
             Command -> 
                 -- TODO: Perform actual behavior for remaining TelnetCommands. 
                 case toTelnetCommand word of
-                    EraseCharacter -> 
-                        case BS.unsnoc buffer of
-                            Just (buffer', _) -> put $ MessageState buffer' Normal
-                            Nothing -> put $ MessageState BS.empty Normal
-                    EraseLine -> put $ MessageState BS.empty Normal
+                    EraseCharacter -> put $ MessageState (eraseCharFromBuffer buffer) Normal
+                    EraseLine -> put $ MessageState Nothing Normal
                     SB -> put $ MessageState buffer SubNegotiation
                     Will -> put $ MessageState buffer Command
                     Wont -> put $ MessageState buffer Command
@@ -89,12 +98,17 @@ handleStream word = do
 processStream :: ByteString -> MessageState
 processStream bs = 
     let stream = BS.unpack bs
-        startingState = MessageState BS.empty Normal
+        startingState = MessageState Nothing Normal
     in execState (mapM_ handleStream stream) startingState
 
 prompt :: Socket -> ByteString -> IO ByteString
 prompt sock prefix = do
     sendAll sock prefix
     rawMsg <- recv sock 1024
+    print $ BS.append (encodeUtf8 "raw message: ") (rawMsg)
     let (MessageState msg _) = processStream rawMsg
-    return msg
+    case msg of
+        Nothing -> prompt sock prefix
+        Just msg' -> do
+            print $ BS.append (encodeUtf8 "message: ") msg'
+            return msg'

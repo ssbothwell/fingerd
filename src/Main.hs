@@ -8,6 +8,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.Class
 import Data.List (intersperse, find, intercalate)
+import Data.ByteString as BS (pack, append)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -55,6 +56,9 @@ data State =
 ---- Server Functions ----
 --------------------------
 
+(+++) :: Text -> Text -> Text
+(+++) = T.append
+
 -- I wish this worked:
 --checkLogin' :: Connection -> Either Text Text -> Either Text Text -> IO (Either Text Account)
 --checkLogin' conn acc pass = do
@@ -84,8 +88,9 @@ loginPrompt = do
 
     thread <- liftIO $ myThreadId
     account <- liftIO $ prompt sock "Login: "
+    suppressEcho
     password <- liftIO $ prompt sock "Password: "
-
+    unsuppressEcho
     let parsedAccount = resultToEither $ parseByteString word mempty account
     let parsedPassword = resultToEither $ parseByteString word mempty password
     
@@ -95,7 +100,7 @@ loginPrompt = do
         Right acc -> do
             state' <- liftIO $ readTVarIO stateTVar
             writeTVarR $ State ((acc, thread):(getWhois state'))
-            liftIO $ print $ T.append (getAccount acc) " Logged In"
+            liftIO $ print $ (getAccount acc) +++ " Logged In"
             sendMsg "Login Succesful"
             handleControlQuery
 
@@ -141,7 +146,19 @@ broadcast msg = do
 sendMsg :: Text -> ReaderT ThreadEnv IO ()
 sendMsg msg = do
     sock <- asks getControlSock'
-    liftIO . sendAll sock . encodeUtf8 $ T.append msg "\r\n"
+    liftIO . sendAll sock . encodeUtf8 $ msg +++ "\r\n"
+
+suppressEcho :: ReaderT ThreadEnv IO ()
+suppressEcho = do
+    sock <- asks getControlSock'
+    liftIO . print $ BS.append (encodeUtf8 "suppressing Echo: ") (BS.pack [255,251,1])
+    liftIO . sendAll sock $ BS.pack [255,251,1]
+
+unsuppressEcho :: ReaderT ThreadEnv IO ()
+unsuppressEcho = do
+    sock <- asks getControlSock'
+    liftIO . print $ BS.pack [255,252,1]
+    liftIO . sendAll sock $ BS.pack [255,252,1]
 
 forkReader :: ReaderT r IO () -> ReaderT r IO ThreadId
 forkReader action = do
@@ -156,7 +173,6 @@ readTChanLoop = void . forkReader . forever $ do
 
 whois :: State -> Text
 whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
-
 
 
 ----------------------
@@ -183,7 +199,7 @@ processCommand (Just (account, _)) = do
         Right Logout -> logout account
         Right Shutdown -> sendMsg "Shutting Down! Goodbye!" >> liftIO (SQLite.close conn >> close sock >> exitSuccess)
         Right Whois -> sendMsg (whois state)
-        Right (Say msg) -> broadcast (T.unpack msg)
+        Right (Say msg) -> broadcast . T.unpack $ T.concat ["<", getAccount account, "> ", msg]
         Left err' -> sendMsg "Command not recognized" >> liftIO (putStrLn $ show err')
 
 handleControlQuery :: ReaderT ThreadEnv IO ()
@@ -235,7 +251,7 @@ controld = forever $ do
     conn <- asks getConn
     sock <- asks getControlSock
     wChannel<- asks getWChannel
-    rChannel <- liftIO . atomically $ cloneTChan wChannel
+    rChannel <- liftIO . atomically $ dupTChan wChannel
     (sock', _) <- lift $ accept sock
 
 
