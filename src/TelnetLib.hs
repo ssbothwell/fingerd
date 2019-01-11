@@ -108,7 +108,7 @@ prompt sock prefix = do
     print $ BS.append (encodeUtf8 "raw message: ") (rawMsg)
     let (MessageState msg _) = processStream rawMsg
     case msg of
-        Nothing -> prompt sock prefix
+        Nothing -> prompt sock ""
         Just msg' -> do
             print $ BS.append (encodeUtf8 "message: ") msg'
             return msg'

@@ -3,6 +3,7 @@ module Main where
 
 import Control.Concurrent
 import Control.Concurrent.STM
+--import Control.Exception (bracket)
 import Control.Monad (forever, void)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Reader
@@ -47,7 +48,7 @@ data ThreadEnv =
 type Msg = String
 type Username = String
 
-data State = 
+newtype State = 
     State { getWhois :: [(Account, ThreadId)] } 
     deriving Show
 
@@ -86,7 +87,7 @@ loginPrompt = do
     conn <- asks getConn'
     sock <- asks getControlSock'
 
-    thread <- liftIO $ myThreadId
+    thread <- liftIO myThreadId
     account <- liftIO $ prompt sock "Login: "
     suppressEcho
     password <- liftIO $ prompt sock "Password: "
@@ -99,12 +100,12 @@ loginPrompt = do
         Left err' -> liftIO (print err') >> sendMsg err' >> loginPrompt
         Right acc -> do
             state' <- liftIO $ readTVarIO stateTVar
-            writeTVarR $ State ((acc, thread):(getWhois state'))
-            liftIO $ print $ (getAccount acc) +++ " Logged In"
-            sendMsg "Login Succesful"
+            writeTVarR $ State ((acc, thread):getWhois state')
+            liftIO $ print $ getAccount acc +++ " Logged In"
+            sendMsg "\r\nLogin Succesful"
             handleControlQuery
 
-addUser :: Connection -> User -> IO (Text)
+addUser :: Connection -> User -> IO Text
 addUser conn (User _ a b c d e) = do
     eInserted <- insertUser conn [a, b, c, d, e]
     case eInserted of
@@ -123,7 +124,7 @@ getUsers conn = do
     rows <- query_ conn selectUsersQuery
     let usernames = map getUsername rows
         newlineSeperated =
-            T.concat $ (intersperse "\n" usernames) ++ pure (T.pack "\r\n")
+            T.concat $ intersperse "\n" usernames ++ pure (T.pack "\r\n")
     return newlineSeperated
 
 logout :: Account -> ReaderT ThreadEnv IO ()
@@ -172,7 +173,7 @@ readTChanLoop = void . forkReader . forever $ do
     sendMsg (T.pack msg)
 
 whois :: State -> Text
-whois curState = T.pack . intercalate ", " . fmap (show . fst) $ (getWhois curState)
+whois curState = T.pack . intercalate ", " . fmap (show . fst) $ getWhois curState
 
 
 ----------------------
@@ -188,8 +189,8 @@ processCommand (Just (account, _)) = do
     state <- liftIO $ readTVarIO stateTVar
 
     cmd <- liftIO $ prompt sock "> "
-    cmdParse <- pure $ runParse cmd
-    liftIO $ putStrLn $ show cmdParse
+    let cmdParse = runParse cmd
+    liftIO $ print cmdParse
     case cmdParse of
         Right GetUsers -> liftIO (getUsers conn) >>= sendMsg
         Right (GetUser user) -> liftIO (getUser conn user) >>= sendMsg
@@ -200,14 +201,14 @@ processCommand (Just (account, _)) = do
         Right Shutdown -> sendMsg "Shutting Down! Goodbye!" >> liftIO (SQLite.close conn >> close sock >> exitSuccess)
         Right Whois -> sendMsg (whois state)
         Right (Say msg) -> broadcast . T.unpack $ T.concat ["<", getAccount account, "> ", msg]
-        Left err' -> sendMsg "Command not recognized" >> liftIO (putStrLn $ show err')
+        Left err' -> sendMsg "Command not recognized" >> liftIO (print err')
 
 handleControlQuery :: ReaderT ThreadEnv IO ()
 handleControlQuery = do
     stateTVar <- asks getStateTVar'
 
     state <- liftIO $ readTVarIO stateTVar
-    thread <- liftIO $ myThreadId
+    thread <- liftIO myThreadId
     readTChanLoop
     liftIO $ print state
     liftIO $ print thread
@@ -254,6 +255,7 @@ controld = forever $ do
     rChannel <- liftIO . atomically $ dupTChan wChannel
     (sock', _) <- lift $ accept sock
 
+    void . forkReader . forever . liftIO . atomically $ readTChan rChannel
 
     lift $ do
         putStrLn "Got connection, handling query"
