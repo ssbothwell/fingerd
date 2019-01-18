@@ -245,7 +245,7 @@ fingerd = forever $ do
     lift $ do
         putStrLn "Got connection, handling query"
         handleQuery conn sock'
-    
+
 controld :: ReaderT Env IO ()
 controld = forever $ do
     stateTVar <- asks getStateTVar

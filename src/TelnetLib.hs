@@ -33,7 +33,7 @@ data TelnetCommand =
     deriving (Show, Eq)
 
 data MessageMode = Normal | Command | SubNegotiation
-data MessageState = MessageState { getBuffer :: (Maybe ByteString), getMessageMode :: MessageMode }
+data MessageState = MessageState { getBuffer :: Maybe ByteString, getMessageMode :: MessageMode }
 
 toTelnetCommand :: Word8 -> TelnetCommand
 toTelnetCommand w
@@ -103,9 +103,9 @@ processStream bs =
 
 prompt :: Socket -> ByteString -> IO ByteString
 prompt sock prefix = do
-    sendAll sock prefix
+    sendAll sock (BS.append prefix (BS.pack [255, 249]))
     rawMsg <- recv sock 1024
-    print $ BS.append (encodeUtf8 "raw message: ") (rawMsg)
+    print $ BS.append (encodeUtf8 "raw message: ") rawMsg
     let (MessageState msg _) = processStream rawMsg
     case msg of
         Nothing -> prompt sock ""
